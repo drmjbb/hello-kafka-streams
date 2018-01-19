@@ -1,0 +1,594 @@
+
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+
+import java.util.Properties;
+
+public class buildProducer {
+    private static buildProducer publisher = new buildProducer();
+    private Producer<String,JsonNode> producer;
+
+    private buildProducer() {
+        Properties config = new Properties();
+        config.setProperty(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "10.198.152.150:9000");
+        config.setProperty(ProducerConfig.ACKS_CONFIG, "all"); // strongest producing guarantee
+        config.setProperty(ProducerConfig.RETRIES_CONFIG, "3");
+        config.setProperty(ProducerConfig.LINGER_MS_CONFIG, "1");
+        config.setProperty(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true"); // ensure we don't push duplicates
+        config.setProperty(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.connect.json.JsonSerializer");
+        config.setProperty(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringSerializer");
+        producer = new KafkaProducer<>(config);
+    }
+
+    static void message ( ObjectNode value) {
+        publisher.producer.send( new ProducerRecord<>("va-raw", value));
+    }
+}
+
+
+
+
+
+
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.connect.json.JsonDeserializer;
+import org.apache.kafka.connect.json.JsonSerializer;
+import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.kstream.Materialized;
+import org.apache.kafka.streams.processor.WallclockTimestampExtractor;
+
+import java.util.List;
+import java.util.Properties;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+class VxSerdes extends Serdes {
+    static public final class JsonSerde extends WrapperSerde<JsonNode> {
+        public JsonSerde() {
+            super(new JsonSerializer(), new JsonDeserializer());
+        }
+    }
+}
+
+public class buildStreamer {
+
+    private static Properties config = new Properties();
+
+    public static void main(String[] args) throws Exception {
+
+        config.setProperty(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "10.198.152.150:9000");
+        config.setProperty(StreamsConfig.DEFAULT_TIMESTAMP_EXTRACTOR_CLASS_CONFIG, WallclockTimestampExtractor.class.getCanonicalName());
+        config.setProperty(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, "org.apache.kafka.common.serialization.Serdes$StringSerde");
+        config.setProperty(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, "com.sc.va.VxSerdes$JsonSerde" );
+        config.setProperty(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, StreamsConfig.EXACTLY_ONCE);
+        config.setProperty(StreamsConfig.APPLICATION_ID_CONFIG, "va-buildtreams_dev1");
+
+        StreamsBuilder builder = new StreamsBuilder();
+
+        builder.<String, JsonNode> stream( "va-raw")
+                .flatMap( buildStreamer::mapRawRecord)
+                .groupByKey()
+                    .reduce( (reduction, newJson) -> ((ObjectNode) reduction).setAll((ObjectNode) newJson),
+                            Materialized.as("allBuilds"))
+                    .toStream()
+                .through("va-allBuilds3")
+                .groupBy( (k, v) -> '"'+v.path("data").path("fullProjectName").asText()+'"')
+                    .reduce( (b1, b2) -> b2 , Materialized.as( "latestBuilds"))
+                    .toStream()
+                .to( "va-latestBuilds3");
+
+        KafkaStreams streams = new KafkaStreams(builder.build(), config);
+        streams.cleanUp(); // only do this in dev - not in prod
+        streams.start();
+
+        // print the topology
+        System.out.println(streams.toString());
+
+        // shutdown hook to correctly close the streams application
+        Runtime.getRuntime().addShutdownHook(new Thread(streams::close));
+
+        RestServer server = new RestServer( streams);
+        server.start(8000);
+
+    }
+
+    private static List< KeyValue< String, JsonNode>> mapRawRecord(String streamKey, JsonNode value) {
+        String key = streamKey==null ? value.path("data").path("fullProjectName").asText()
+                                    + value.path("data").path("buildNum").asText()
+                : streamKey;
+        System.out.println( key);
+
+        ArrayNode message = (ArrayNode) ((ObjectNode)value).remove("message");
+        StringBuilder consoleLog = new StringBuilder(1024*128);
+        if( message!=null) message.forEach(v->consoleLog.append(v.asText()).append('\n'));
+
+        Stream< JsonNode> result = Stream.concat( buildStreamer.eventsFromConsoleLog( consoleLog.toString()), Stream.of( value));
+        return result.map( v -> KeyValue.pair( key, v)).collect( Collectors.toList());
+    }
+
+    private static Stream< JsonNode> eventsFromConsoleLog(String consoleLog) {
+        return Stream.empty();
+    }
+}
+
+
+
+
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.state.KeyValueIterator;
+import org.apache.kafka.streams.state.QueryableStoreTypes;
+import org.apache.kafka.streams.state.ReadOnlyKeyValueStore;
+import org.apache.kafka.streams.state.ReadOnlyWindowStore;
+import org.apache.kafka.streams.state.WindowStoreIterator;
+import org.eclipse.jetty.server.Server;
+import org.eclipse.jetty.servlet.ServletContextHandler;
+import org.eclipse.jetty.servlet.ServletHolder;
+import org.glassfish.jersey.jackson.JacksonFeature;
+import org.glassfish.jersey.server.ResourceConfig;
+import org.glassfish.jersey.servlet.ServletContainer;
+
+import javax.ws.rs.*;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.Response;
+import java.util.*;
+import java.util.function.Function;
+import org.apache.kafka.common.serialization.Serializer;
+import org.apache.kafka.streams.state.StreamsMetadata;
+
+import java.util.stream.Collectors;
+
+
+/**
+ *  A simple REST proxy that runs embedded in the {WordCountInteractiveQueriesExample}. This is used to
+ *  demonstrate how a developer can use the Interactive Queries APIs exposed by Kafka Streams to
+ *  locate and query the State Stores within a Kafka Streams Application.
+ */
+@Path("state")
+public class RestServer {
+
+    private final KafkaStreams streams;
+    private final MetadataService metadataService;
+    private Server jettyServer;
+
+    RestServer(final KafkaStreams streams) {
+        this.streams = streams;
+        this.metadataService = new MetadataService( streams);
+    }
+
+    /**
+     * Get a key-value pair from a KeyValue Store
+     * @param storeName   the store to look in
+     * @param key         the key to get
+     * @return {@link KeyValueBean} representing the key-value pair
+     */
+    @GET
+    @Path("/keyvalue/{storeName}/{key}")
+    @Produces(MediaType.APPLICATION_JSON)
+    public KeyValueBean byKey(@PathParam("storeName") final String storeName,
+                              @PathParam("key") final String key) {
+
+        // Lookup the KeyValueStore with the provided storeName
+        final ReadOnlyKeyValueStore<String, JsonNode> store = streams.store(storeName, QueryableStoreTypes.<String, JsonNode>keyValueStore());
+        if (store == null) {
+            throw new NotFoundException();
+        }
+
+        // Get the value from the store
+        final JsonNode value = store.get(key);
+        if (value == null) {
+            throw new NotFoundException();
+        }
+        return new KeyValueBean(key, value);
+    }
+
+    /**
+     * Get all of the key-value pairs available in a store
+     * @param storeName   store to query
+     * @return A List of {@link KeyValueBean}s representing all of the key-values in the provided
+     * store
+     */
+    @GET()
+    @Path("/keyvalues/{storeName}/all")
+    @Produces(MediaType.APPLICATION_JSON)
+    public List<KeyValueBean> allForStore(@PathParam("storeName") final String storeName) {
+        return rangeForKeyValueStore(storeName, ReadOnlyKeyValueStore::all);
+    }
+
+
+    /**
+     * Get all of the key-value pairs that have keys within the range from...to
+     * @param storeName   store to query
+     * @param from        start of the range (inclusive)
+     * @param to          end of the range (inclusive)
+     * @return A List of {@link KeyValueBean}s representing all of the key-values in the provided
+     * store that fall withing the given range.
+     */
+    @GET()
+    @Path("/keyvalues/{storeName}/range/{from}/{to}")
+    @Produces(MediaType.APPLICATION_JSON)
+    public List<KeyValueBean> keyRangeForStore(@PathParam("storeName") final String storeName,
+                                               @PathParam("from") final String from,
+                                               @PathParam("to") final String to) {
+        return rangeForKeyValueStore(storeName, store -> store.range(from, to));
+    }
+
+    /**
+     * Query a window store for key-value pairs representing the value for a provided key within a
+     * range of windows
+     * @param storeName   store to query
+     * @param key         key to look for
+     * @param from        time of earliest window to query
+     * @param to          time of latest window to query
+     * @return A List of {@link KeyValueBean}s representing the key-values for the provided key
+     * across the provided window range.
+     */
+    @GET()
+    @Path("/windowed/{storeName}/{key}/{from}/{to}")
+    @Produces(MediaType.APPLICATION_JSON)
+    public List<KeyValueBean> windowedByKey(@PathParam("storeName") final String storeName,
+                                            @PathParam("key") final String key,
+                                            @PathParam("from") final Long from,
+                                            @PathParam("to") final Long to) {
+
+        // Lookup the WindowStore with the provided storeName
+        final ReadOnlyWindowStore<String, JsonNode> store = streams.store(storeName,
+                QueryableStoreTypes.<String, JsonNode>windowStore());
+        if (store == null) {
+            throw new NotFoundException();
+        }
+
+        // fetch the window results for the given key and time range
+        final WindowStoreIterator<JsonNode> results = store.fetch(key, from, to);
+
+        final List<KeyValueBean> windowResults = new ArrayList<>();
+        while (results.hasNext()) {
+            final KeyValue<Long, JsonNode> next = results.next();
+            // convert the result to have the window time and the key (for display purposes)
+            windowResults.add(new KeyValueBean(key + "@" + next.key, next.value));
+        }
+        return windowResults;
+    }
+
+    /**
+     * Get the metadata for all of the instances of this Kafka Streams application
+     * @return List of {@link HostStoreInfo}
+     */
+    @GET()
+    @Path("/instances")
+    @Produces(MediaType.APPLICATION_JSON)
+    public List<HostStoreInfo> streamsMetadata() {
+        return metadataService.streamsMetadata();
+    }
+
+    /**
+     * Get the metadata for all instances of this Kafka Streams application that currently
+     * has the provided store.
+     * @param store   The store to locate
+     * @return  List of {@link HostStoreInfo}
+     */
+    @GET()
+    @Path("/instances/{storeName}")
+    @Produces(MediaType.APPLICATION_JSON)
+    public List<HostStoreInfo> streamsMetadataForStore(@PathParam("storeName") String store) {
+        return metadataService.streamsMetadataForStore(store);
+    }
+
+    /**
+     * Find the metadata for the instance of this Kafka Streams Application that has the given
+     * store and would have the given key if it exists.
+     * @param store   Store to find
+     * @param key     The key to find
+     * @return {@link HostStoreInfo}
+     */
+    @GET()
+    @Path("/instance/{storeName}/{key}")
+    @Produces(MediaType.APPLICATION_JSON)
+    public HostStoreInfo streamsMetadataForStoreAndKey(@PathParam("storeName") String store,
+                                                       @PathParam("key") String key) {
+        return metadataService.streamsMetadataForStoreAndKey(store, key, new StringSerializer());
+    }
+
+    /**
+     * Find the metadata for the instance of this Kafka Streams Application that has the given
+     * store and would have the given key if it exists.
+     * @param body   Store to find
+
+     */
+    @POST()
+    @Path("/va-raw/")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response newRawBuildEvent(final JsonNode body) {
+        if( body.path("data").get("fullProjectName") == null
+                || body.path("data").get("buildNum") == null)
+            return Response.status(400).build();
+        buildProducer.message((ObjectNode) body);
+        return Response.status(201).build();
+    }
+
+
+    /**
+     * Performs a range query on a KeyValue Store and converts the results into a List of
+     * {@link KeyValueBean}
+     * @param storeName       The store to query
+     * @param rangeFunction   The range query to run, i.e., all, from(start, end)
+     * @return  List of {@link KeyValueBean}
+     */
+    private List<KeyValueBean> rangeForKeyValueStore(final String storeName,
+                                                     final Function<ReadOnlyKeyValueStore<String, JsonNode>,
+                                                             KeyValueIterator<String, JsonNode>> rangeFunction) {
+
+        // Get the KeyValue Store
+        final ReadOnlyKeyValueStore<String, JsonNode> store = streams.store(storeName, QueryableStoreTypes.keyValueStore());
+        if (store == null) {
+            throw new NotFoundException();
+        }
+
+        final List<KeyValueBean> results = new ArrayList<>();
+        // Apply the function, i.e., query the store
+        final KeyValueIterator<String, JsonNode> range = rangeFunction.apply(store);
+
+        // Convert the results
+        while (range.hasNext()) {
+            final KeyValue<String, JsonNode> next = range.next();
+            results.add(new KeyValueBean(next.key, next.value));
+        }
+
+        return results;
+    }
+
+    /**
+     * Start an embedded Jetty Server on the given port
+     * @param port    port to run the Server on
+     * @throws Exception
+     */
+    void start(final int port) throws Exception {
+        ServletContextHandler context = new ServletContextHandler(ServletContextHandler.SESSIONS);
+        context.setContextPath("/");
+
+        jettyServer = new Server(port);
+        jettyServer.setHandler(context);
+
+        ResourceConfig rc = new ResourceConfig();
+        rc.register(this);
+        rc.register(JacksonFeature.class);
+
+        ServletContainer sc = new ServletContainer(rc);
+        ServletHolder holder = new ServletHolder(sc);
+        context.addServlet(holder, "/*");
+
+        jettyServer.start();
+    }
+
+    /**
+     * Stop the Jetty Server
+     * @throws Exception
+     */
+    void stop() throws Exception {
+        if (jettyServer != null) {
+            jettyServer.stop();
+        }
+    }
+
+}
+
+/**
+ * Looks up StreamsMetadata from KafkaStreams and converts the results
+ * into Beans that can be JSON serialized via Jersey.
+ */
+class MetadataService {
+
+    private final KafkaStreams streams;
+
+    public MetadataService(final KafkaStreams streams) {
+        this.streams = streams;
+    }
+
+    /**
+     * Get the metadata for all of the instances of this Kafka Streams application
+     * @return List of {@link HostStoreInfo}
+     */
+    public List<HostStoreInfo> streamsMetadata() {
+        // Get metadata for all of the instances of this Kafka Streams application
+        final Collection<StreamsMetadata> metadata = streams.allMetadata();
+        return mapInstancesToHostStoreInfo(metadata);
+    }
+
+    /**
+     * Get the metadata for all instances of this Kafka Streams application that currently
+     * has the provided store.
+     * @param store   The store to locate
+     * @return  List of {@link HostStoreInfo}
+     */
+    public List<HostStoreInfo> streamsMetadataForStore(final  String store) {
+        // Get metadata for all of the instances of this Kafka Streams application hosting the store
+        final Collection<StreamsMetadata> metadata = streams.allMetadataForStore(store);
+        return mapInstancesToHostStoreInfo(metadata);
+    }
+
+    /**
+     * Find the metadata for the instance of this Kafka Streams Application that has the given
+     * store and would have the given key if it exists.
+     * @param store   Store to find
+     * @param key     The key to find
+     * @return {@link HostStoreInfo}
+     */
+    public <K> HostStoreInfo streamsMetadataForStoreAndKey(final String store,
+                                                           final K key,
+                                                           final Serializer<K> serializer) {
+        // Get metadata for the instances of this Kafka Streams application hosting the store and
+        // potentially the value for key
+        final StreamsMetadata metadata = streams.metadataForKey(store, key, serializer);
+        if (metadata == null) {
+            throw new NotFoundException();
+        }
+
+        return new HostStoreInfo(metadata.host(),
+                metadata.port(),
+                metadata.stateStoreNames());
+    }
+
+    private List<HostStoreInfo> mapInstancesToHostStoreInfo(
+            final Collection<StreamsMetadata> metadatas) {
+        return metadatas.stream().map(metadata -> new HostStoreInfo(metadata.host(),
+                metadata.port(),
+                metadata.stateStoreNames()))
+                .collect(Collectors.toList());
+    }
+
+}
+
+/**
+ * A simple bean that can be JSON serialized via Jersey. Represents a KafkaStreams instance
+ * that has a set of state stores. See for how it is used.
+ *
+ * We use this JavaBean based approach as it fits nicely with JSON serialization provided by
+ * jax-rs/jersey
+ */
+class HostStoreInfo {
+
+    private String host;
+    private int port;
+    private Set<String> storeNames;
+
+    public HostStoreInfo(){}
+
+    HostStoreInfo(final String host, final int port, final Set<String> storeNames) {
+        this.host = host;
+        this.port = port;
+        this.storeNames = storeNames;
+    }
+
+    public String getHost() {
+        return host;
+    }
+
+    public void setHost(final String host) {
+        this.host = host;
+    }
+
+    public int getPort() {
+        return port;
+    }
+
+    public void setPort(final int port) {
+        this.port = port;
+    }
+
+    public Set<String> getStoreNames() {
+        return storeNames;
+    }
+
+    public void setStoreNames(final Set<String> storeNames) {
+        this.storeNames = storeNames;
+    }
+
+    @Override
+    public String toString() {
+        return "HostStoreInfo{" +
+                "host='" + host + '\'' +
+                ", port=" + port +
+                ", storeNames=" + storeNames +
+                '}';
+    }
+
+    @Override
+    public boolean equals(final Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        final HostStoreInfo that = (HostStoreInfo) o;
+        return port == that.port &&
+                Objects.equals(host, that.host) &&
+                Objects.equals(storeNames, that.storeNames);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(host, port, storeNames);
+    }
+}
+
+
+/**
+ *
+ * We use this JavaBean based approach as it fits nicely with JSON serialization provided by
+ * jax-rs/jersey
+ */
+class KeyValueBean {
+
+    private String key;
+    private JsonNode value;
+
+    public KeyValueBean() {}
+
+    KeyValueBean(final String key, final JsonNode value) {
+        this.key = key;
+        this.value = value;
+    }
+
+    public String getKey() {
+
+        return key;
+    }
+
+    public void setKey(final String key) {
+        this.key = key;
+    }
+
+    public JsonNode getValue() {
+        return value;
+    }
+
+    public void setValue(final JsonNode value) {
+        this.value = value;
+    }
+
+    @Override
+    public boolean equals(final Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        final KeyValueBean that = (KeyValueBean) o;
+        return Objects.equals(key, that.key) &&
+                Objects.equals(value, that.value);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(key, value);
+    }
+
+    @Override
+    public String toString() {
+        return "KeyValueBean{" +
+                "key='" + key + '\'' +
+                ", value=" + value +
+                '}';
+    }
+}
+
